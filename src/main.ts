@@ -11,8 +11,12 @@ import { DragHandler } from './drag-handler';
 export default class FolderSortRulesPlugin extends Plugin {
 	settings: FolderSortRulesSettings = DEFAULT_SETTINGS;
 	private originalSort: (() => void) | null = null;
+	private originalRequestSort: (() => void) | null = null;
 	private dragHandler: DragHandler;
 	private explorerView: any = null;
+	private sortTimer: number | null = null;
+	private observer: MutationObserver | null = null;
+	private isApplyingSort = false;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -25,13 +29,13 @@ export default class FolderSortRulesPlugin extends Plugin {
 
 		// Re-sort when vault contents change
 		this.registerEvent(
-			this.app.vault.on('create', () => this.requestSort())
+			this.app.vault.on('create', () => this.scheduleCustomSort())
 		);
 		this.registerEvent(
-			this.app.vault.on('delete', () => this.requestSort())
+			this.app.vault.on('delete', () => this.scheduleCustomSort())
 		);
 		this.registerEvent(
-			this.app.vault.on('rename', () => this.requestSort())
+			this.app.vault.on('rename', () => this.scheduleCustomSort())
 		);
 
 		// Re-patch if file explorer is recreated
@@ -45,10 +49,23 @@ export default class FolderSortRulesPlugin extends Plugin {
 	}
 
 	onunload(): void {
-		// Restore original sort
-		if (this.explorerView && this.originalSort) {
-			this.explorerView.sort = this.originalSort;
-			this.originalSort = null;
+		// Restore original sort methods
+		if (this.explorerView) {
+			if (this.originalSort) {
+				this.explorerView.sort = this.originalSort;
+				this.originalSort = null;
+			}
+			if (this.originalRequestSort) {
+				this.explorerView.requestSort = this.originalRequestSort;
+				this.originalRequestSort = null;
+			}
+		}
+		if (this.sortTimer !== null) {
+			window.clearTimeout(this.sortTimer);
+		}
+		if (this.observer) {
+			this.observer.disconnect();
+			this.observer = null;
 		}
 		this.dragHandler.cleanup();
 		this.explorerView = null;
@@ -64,13 +81,25 @@ export default class FolderSortRulesPlugin extends Plugin {
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
-		this.requestSort();
+		this.scheduleCustomSort();
 	}
 
 	requestSort(): void {
-		if (this.explorerView) {
-			this.explorerView.sort();
+		this.scheduleCustomSort();
+	}
+
+	/**
+	 * Debounced custom sort — schedules applyCustomSort to run after
+	 * Obsidian has finished its own async DOM updates.
+	 */
+	private scheduleCustomSort(): void {
+		if (this.sortTimer !== null) {
+			window.clearTimeout(this.sortTimer);
 		}
+		this.sortTimer = window.setTimeout(() => {
+			this.sortTimer = null;
+			this.applyCustomSort();
+		}, 50);
 	}
 
 	private getFileExplorerLeaf(): WorkspaceLeaf | null {
@@ -89,17 +118,28 @@ export default class FolderSortRulesPlugin extends Plugin {
 		if (this.explorerView === view) return;
 
 		this.explorerView = view;
-		this.originalSort = view.sort.bind(view);
 
+		// Patch sort()
+		this.originalSort = view.sort.bind(view);
 		const plugin = this;
 		view.sort = function () {
-			// Call original sort first
 			if (plugin.originalSort) {
 				plugin.originalSort();
 			}
-			// Apply our custom sort on top
-			plugin.applyCustomSort();
+			// Defer custom sort to run after Obsidian finishes DOM updates
+			plugin.scheduleCustomSort();
 		};
+
+		// Also patch requestSort() if it exists — some code paths call it directly
+		if (typeof view.requestSort === 'function') {
+			this.originalRequestSort = view.requestSort.bind(view);
+			view.requestSort = function () {
+				if (plugin.originalRequestSort) {
+					plugin.originalRequestSort();
+				}
+				plugin.scheduleCustomSort();
+			};
+		}
 
 		// Register cleanup
 		this.register(() => {
@@ -107,10 +147,46 @@ export default class FolderSortRulesPlugin extends Plugin {
 				view.sort = this.originalSort;
 				this.originalSort = null;
 			}
+			if (this.originalRequestSort) {
+				view.requestSort = this.originalRequestSort;
+				this.originalRequestSort = null;
+			}
 		});
 
+		// MutationObserver as a safety net — catches DOM reorders
+		// that bypass our patched methods
+		this.setupMutationObserver(view);
+
 		// Apply initial sort
-		this.applyCustomSort();
+		this.scheduleCustomSort();
+	}
+
+	private setupMutationObserver(view: any): void {
+		if (this.observer) {
+			this.observer.disconnect();
+		}
+
+		const containerEl = view.containerEl as HTMLElement | undefined;
+		if (!containerEl) return;
+
+		this.observer = new MutationObserver(() => {
+			// Only react if we're not the ones currently sorting
+			if (!this.isApplyingSort) {
+				this.scheduleCustomSort();
+			}
+		});
+
+		this.observer.observe(containerEl, {
+			childList: true,
+			subtree: true,
+		});
+
+		this.register(() => {
+			if (this.observer) {
+				this.observer.disconnect();
+				this.observer = null;
+			}
+		});
 	}
 
 	private applyCustomSort(): void {
@@ -120,26 +196,36 @@ export default class FolderSortRulesPlugin extends Plugin {
 		const fileItems = this.explorerView.fileItems;
 		if (!fileItems) return;
 
-		// Collect all folder paths that need custom sorting
-		const processedFolders = new Set<string>();
+		// Guard against re-entrant calls from MutationObserver
+		this.isApplyingSort = true;
 
-		for (const path of Object.keys(fileItems)) {
-			const item = fileItems[path];
-			if (!item) continue;
+		try {
+			// Collect all folder paths that need custom sorting
+			const processedFolders = new Set<string>();
 
-			const file = item.file;
-			if (!(file instanceof TFolder)) continue;
-			if (processedFolders.has(path)) continue;
+			for (const path of Object.keys(fileItems)) {
+				const item = fileItems[path];
+				if (!item) continue;
 
-			const rule = resolveRule(path, this.settings);
-			if (!rule) continue;
+				const file = item.file;
+				if (!(file instanceof TFolder)) continue;
+				if (processedFolders.has(path)) continue;
 
-			this.sortFolderChildren(item, file, rule);
-			processedFolders.add(path);
+				const rule = resolveRule(path, this.settings);
+				if (!rule) continue;
+
+				this.sortFolderChildren(item, file, rule);
+				processedFolders.add(path);
+			}
+
+			// Setup drag handlers for manual sort
+			this.dragHandler.setup(this.explorerView);
+		} finally {
+			// Use rAF to keep the guard up until the DOM has settled
+			requestAnimationFrame(() => {
+				this.isApplyingSort = false;
+			});
 		}
-
-		// Setup drag handlers for manual sort
-		this.dragHandler.setup(this.explorerView);
 	}
 
 	private sortFolderChildren(
