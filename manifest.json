@@ -1,0 +1,9 @@
+{
+	"id": "folder-sort-rules",
+	"name": "Folder Sort Rules",
+	"version": "1.0.0",
+	"minAppVersion": "1.12.0",
+	"description": "Define custom sort orders per folder, overriding the global file explorer sorting with independent rules for files and subfolders.",
+	"author": "Adam",
+	"isDesktopOnly": false
+}

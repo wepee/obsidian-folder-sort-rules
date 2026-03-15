@@ -1,0 +1,41 @@
+/* Rule container in settings */
+.folder-sort-rules-rule {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	padding: var(--size-4-2);
+	margin-bottom: var(--size-4-3);
+}
+
+.folder-sort-rules-empty {
+	color: var(--text-muted);
+	font-style: italic;
+}
+
+/* Folder picker in settings */
+.folder-sort-rules-picker {
+	border: 1px solid var(--interactive-accent);
+	border-radius: var(--radius-m);
+	padding: var(--size-4-2);
+	margin-bottom: var(--size-4-3);
+	background-color: var(--background-secondary);
+}
+
+/* Drag & drop styles */
+.folder-sort-rules-draggable {
+	cursor: grab;
+}
+
+.folder-sort-rules-draggable:active {
+	cursor: grabbing;
+}
+
+.folder-sort-rules-dragging {
+	opacity: 0.4;
+}
+
+.folder-sort-rules-drop-indicator {
+	height: 2px;
+	background-color: var(--interactive-accent);
+	border-radius: 1px;
+	margin: 0 var(--size-4-2);
+}
